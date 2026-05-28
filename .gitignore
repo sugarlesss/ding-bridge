@@ -1,0 +1,12 @@
+.env
+config.ini
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.sessions/
+logs/
+*.log
+.DS_Store

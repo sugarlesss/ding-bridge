@@ -1,0 +1,60 @@
+[claude]
+# Claude Code CLI 绝对路径，可通过 `which claude` 查得
+cli_path = claude
+# Claude 运行的工作目录（CLI 的 cwd）—— 作为所有 bot 的默认值
+cwd = /home/admin
+# 指定模型（留空使用默认模型）。示例：claude-sonnet-4-6 / claude-opus-4-7
+model =
+# 权限模式：非交互场景下必须设置，否则工具调用会被阻塞
+# 可选值：default / acceptEdits / bypassPermissions / plan / auto / dontAsk
+permission_mode = bypassPermissions
+# 工具白名单，空=全放开。示例：Read Grep Glob WebSearch WebFetch
+allowed_tools =
+# 工具黑名单，空=都允许。示例：Bash Write Edit
+disallowed_tools =
+# 追加到系统提示末尾
+append_system_prompt =
+
+[runtime]
+# 单次 CLI 调用的超时秒数
+cli_timeout_seconds = 300
+# 会话记录根目录（每个 bot 会在其下创建子目录，如 .sessions/my-ai/）
+session_store_dir = .sessions
+# 日志级别
+log_level = INFO
+
+# ─── 机器人配置 ───────────────────────────────────────────────────────────────
+# 每个 [bot:名称] section 定义一个钉钉机器人。
+# 名称可以随意取，会用于日志前缀和 session 隔离目录名。
+#
+# 必填字段：client_id, client_secret
+# 可选字段：robot_code（默认=client_id）, card_template_id, allowed_staff_ids
+#
+# Claude 相关字段（cwd/model/permission_mode/allowed_tools/disallowed_tools/
+# append_system_prompt/cli_timeout_seconds）如不配置，则继承 [claude] / [runtime] 的全局值。
+# 如需某个 bot 使用不同的工作目录或模型，直接在该 section 中覆盖即可。
+
+[bot:my-ai]
+# 钉钉应用凭证
+client_id = your-client-id
+client_secret = your-client-secret-here
+robot_code = your-robot-code
+# AI 卡片模板 ID（在钉钉卡片平台 https://open-dev.dingtalk.com/fe/card 建模板后获取）
+# 留空表示不用卡片，降级为 Markdown 消息
+card_template_id =
+card_content_key = content
+# 白名单：允许 @ 机器人触发 CLI 的 staffId 列表，逗号分隔
+# 留空表示不限制（不推荐）
+allowed_staff_ids =
+
+# ─── 示例：第二个机器人，使用不同的工作目录和模型 ───
+# [bot:code-review]
+# client_id = your-second-client-id
+# client_secret = your-second-client-secret
+# robot_code = your-second-robot-code
+# card_template_id =
+# allowed_staff_ids = staffid1,staffid2
+# # 覆盖全局 claude 配置
+# cwd = /home/admin/project/review
+# model = claude-sonnet-4-6
+# append_system_prompt = 你是一个代码审查助手。

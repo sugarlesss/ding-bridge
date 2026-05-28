@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# ding-bridge-manager — ding-bridge 服务管理脚本（macOS / Linux 双平台）
+#
+# 用法：
+#   ./scripts/ding-bridge-manager <命令>
+#
+# 命令列表：
+#   start        启动服务（如果已在跑就提示，不做操作）
+#   stop         停止服务
+#   restart      重启服务
+#   status       查看状态（PID、CPU、内存、运行时长）
+#   logs [N]     看最近 N 行日志（默认 100 行）
+#   follow       实时跟踪日志（Ctrl+C 退出）
+#   tail-err     实时跟踪 stderr
+#   tail-out     实时跟踪 stdout
+#   clear-logs   清空日志文件
+#   install      安装为系统服务（macOS: launchd / Linux: 提示）
+#   uninstall    卸载系统服务
+#   reload       重新加载服务配置（macOS only）
+#   help         显示此帮助
+
+set -euo pipefail
+
+# ===== 自适应路径（兼容 symlink 调用）=====
+_resolve_symlink() {
+  local target="$1"
+  while [ -L "$target" ]; do
+    local dir="$(cd "$(dirname "$target")" && pwd)"
+    target="$(readlink "$target")"
+    [[ "$target" != /* ]] && target="$dir/$target"
+  done
+  echo "$target"
+}
+
+REAL_SCRIPT="$(_resolve_symlink "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+readonly SCRIPT_DIR PROJECT_DIR
+readonly LABEL="com.local.ding-bridge"
+readonly LOG_DIR="${PROJECT_DIR}/logs"
+readonly STDOUT_LOG="${LOG_DIR}/stdout.log"
+readonly STDERR_LOG="${LOG_DIR}/stderr.log"
+readonly PID_FILE="${LOG_DIR}/ding-bridge.pid"
+
+# macOS launchd plist 路径
+readonly PLIST_PATH="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+
+# OS 检测
+readonly OS="$(uname -s)"
+
+# Python 解释器自适应
+if [ -x "${PROJECT_DIR}/.venv/bin/python" ]; then
+  readonly PYTHON="${PROJECT_DIR}/.venv/bin/python"
+else
+  readonly PYTHON="python3"
+fi
+
+# ===== 颜色 =====
+if [ -t 1 ]; then
+  readonly CLR_RESET=$'\033[0m'
+  readonly CLR_BOLD=$'\033[1m'
+  readonly CLR_GREEN=$'\033[32m'
+  readonly CLR_YELLOW=$'\033[33m'
+  readonly CLR_RED=$'\033[31m'
+  readonly CLR_CYAN=$'\033[36m'
+  readonly CLR_DIM=$'\033[2m'
+else
+  readonly CLR_RESET="" CLR_BOLD="" CLR_GREEN="" CLR_YELLOW="" CLR_RED="" CLR_CYAN="" CLR_DIM=""
+fi
+
+log_info() { echo "${CLR_CYAN}ℹ${CLR_RESET}  $*"; }
+log_ok() { echo "${CLR_GREEN}✓${CLR_RESET}  $*"; }
+log_warn() { echo "${CLR_YELLOW}!${CLR_RESET}  $*"; }
+log_err() { echo "${CLR_RED}✗${CLR_RESET}  $*" >&2; }
+
+# ===== 通用工具函数 =====
+
+_ensure_log_dir() {
+  mkdir -p "${LOG_DIR}"
+}
+
+# 检查 PID 是否存活
+_is_running_pid() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# 从 PID 文件读取 PID（Linux 模式用）
+_read_pid_file() {
+  if [ -f "${PID_FILE}" ]; then
+    cat "${PID_FILE}" 2>/dev/null
+  fi
+}
+
+# ===== macOS (launchd) 专用函数 =====
+
+_uid() { id -u; }
+
+_is_loaded() {
+  launchctl list 2>/dev/null | awk '{print $3}' | grep -Fxq "${LABEL}"
+}
+
+_launchd_pid() {
+  launchctl list 2>/dev/null | awk -v l="${LABEL}" '$3 == l { print $1 }' | head -1
+}
+
+_last_exit() {
+  launchctl list 2>/dev/null | awk -v l="${LABEL}" '$3 == l { print $2 }' | head -1
+}
+
+# ===== macOS 命令实现 =====
+
+_mac_install() {
+  if [ ! -f "${PLIST_PATH}" ]; then
+    log_err "plist 文件不存在: ${PLIST_PATH}"
+    log_info "请先创建 plist 文件（可参考 README 或向 AI 求助）"
+    exit 1
+  fi
+  if _is_loaded; then
+    log_warn "服务已经加载过了，无需重复 install"
+    return 0
+  fi
+  launchctl load -w "${PLIST_PATH}"
+  log_ok "服务已安装并开机自启：${LABEL}"
+  sleep 2
+  cmd_status
+}
+
+_mac_uninstall() {
+  if ! _is_loaded; then
+    log_warn "服务未加载，无需卸载"
+    return 0
+  fi
+  launchctl unload "${PLIST_PATH}"
+  log_ok "服务已卸载（开机不再自启）：${LABEL}"
+}
+
+_mac_start() {
+  if ! _is_loaded; then
+    log_warn "服务未安装，自动执行 install"
+    _mac_install
+    return $?
+  fi
+  local pid
+  pid=$(_launchd_pid)
+  if [ -n "${pid:-}" ] && [ "${pid}" != "-" ] && [ "${pid}" != "0" ]; then
+    log_warn "服务已在运行：PID=${pid}"
+    return 0
+  fi
+  launchctl kickstart "gui/$(_uid)/${LABEL}"
+  log_ok "已触发启动"
+  sleep 2
+  cmd_status
+}
+
+_mac_stop() {
+  if ! _is_loaded; then
+    log_warn "服务未加载，无需停止"
+    return 0
+  fi
+  local pid
+  pid=$(_launchd_pid)
+  if [ -z "${pid:-}" ] || [ "${pid}" = "-" ] || [ "${pid}" = "0" ]; then
+    log_warn "服务没有活跃进程"
+    return 0
+  fi
+  launchctl kill TERM "gui/$(_uid)/${LABEL}"
+  log_ok "已发送 TERM 信号，等待进程退出…"
+  for _ in $(seq 1 10); do
+    sleep 1
+    pid=$(_launchd_pid)
+    if [ -z "${pid:-}" ] || [ "${pid}" = "-" ] || [ "${pid}" = "0" ]; then
+      log_ok "服务已停止"
+      return 0
+    fi
+  done
+  log_warn "10 秒内未退出，强制 KILL"
+  launchctl kill KILL "gui/$(_uid)/${LABEL}" || true
+}
+
+_mac_restart() {
+  if ! _is_loaded; then
+    log_warn "服务未安装，自动执行 install"
+    _mac_install
+    return $?
+  fi
+  launchctl kickstart -k "gui/$(_uid)/${LABEL}"
+  log_ok "已触发重启"
+  sleep 2
+  cmd_status
+}
+
+_mac_reload() {
+  if _is_loaded; then
+    launchctl unload "${PLIST_PATH}"
+    log_ok "已 unload"
+  fi
+  launchctl load -w "${PLIST_PATH}"
+  log_ok "已 load（plist 配置重新生效）"
+  sleep 2
+  cmd_status
+}
+
+_mac_status() {
+  if ! _is_loaded; then
+    echo "  安装状态     : ${CLR_RED}未安装${CLR_RESET}"
+    echo
+    log_info "使用 './scripts/ding-bridge-manager install' 来安装并启动"
+    return 0
+  fi
+  echo "  安装状态     : ${CLR_GREEN}已安装（开机自启）${CLR_RESET}"
+  local pid last_exit
+  pid=$(_launchd_pid)
+  last_exit=$(_last_exit)
+  if [ -z "${pid:-}" ] || [ "${pid}" = "-" ] || [ "${pid}" = "0" ]; then
+    echo "  运行状态     : ${CLR_RED}未运行${CLR_RESET}"
+    if [ "${last_exit:-}" != "-" ] && [ -n "${last_exit:-}" ]; then
+      echo "  上次退出码   : ${CLR_YELLOW}${last_exit}${CLR_RESET}"
+    fi
+  else
+    echo "  运行状态     : ${CLR_GREEN}运行中${CLR_RESET}"
+    echo "  PID         : ${pid}"
+    _print_process_info "${pid}"
+    echo "  上次退出码   : ${last_exit:-N/A}"
+  fi
+}
+
+# ===== Linux (nohup + PID file) 命令实现 =====
+
+_linux_start() {
+  _ensure_log_dir
+  local pid
+  pid=$(_read_pid_file)
+  if _is_running_pid "${pid:-}"; then
+    log_warn "服务已在运行：PID=${pid}"
+    return 0
+  fi
+
+  cd "${PROJECT_DIR}"
+  nohup "${PYTHON}" "${PROJECT_DIR}/main.py" >>"${STDOUT_LOG}" 2>>"${STDERR_LOG}" &
+  local new_pid=$!
+  echo "${new_pid}" >"${PID_FILE}"
+  log_ok "服务已启动：PID=${new_pid}"
+  log_info "日志: ${STDERR_LOG}"
+}
+
+_linux_stop() {
+  local pid
+  pid=$(_read_pid_file)
+  if ! _is_running_pid "${pid:-}"; then
+    log_warn "服务未在运行"
+    rm -f "${PID_FILE}"
+    return 0
+  fi
+  kill -TERM "${pid}"
+  log_ok "已发送 TERM 信号（PID=${pid}），等待退出…"
+  for _ in $(seq 1 10); do
+    sleep 1
+    if ! _is_running_pid "${pid}"; then
+      log_ok "服务已停止"
+      rm -f "${PID_FILE}"
+      return 0
+    fi
+  done
+  log_warn "10 秒内未退出，强制 KILL"
+  kill -9 "${pid}" 2>/dev/null || true
+  rm -f "${PID_FILE}"
+  log_ok "已强制终止"
+}
+
+_linux_restart() {
+  _linux_stop
+  sleep 1
+  _linux_start
+}
+
+_linux_status() {
+  local pid
+  pid=$(_read_pid_file)
+  if _is_running_pid "${pid:-}"; then
+    echo "  运行状态     : ${CLR_GREEN}运行中${CLR_RESET}"
+    echo "  PID         : ${pid}"
+    _print_process_info "${pid}"
+  else
+    echo "  运行状态     : ${CLR_RED}未运行${CLR_RESET}"
+    if [ -n "${pid:-}" ]; then
+      echo "  上次记录 PID : ${pid}（已退出）"
+    fi
+  fi
+}
+
+_linux_install() {
+  log_info "Linux 下暂不支持自动安装为系统服务"
+  log_info "可手动将以下内容加入 crontab 实现开机自启："
+  echo
+  echo "  @reboot cd ${PROJECT_DIR} && ./scripts/ding-bridge-manager start"
+  echo
+}
+
+_linux_uninstall() {
+  log_info "Linux 下请手动移除 crontab 中的对应条目"
+}
+
+_linux_reload() {
+  log_info "Linux 模式下 reload 等同于 restart"
+  _linux_restart
+}
+
+# ===== 通用命令实现 =====
+
+_print_process_info() {
+  local pid="$1"
+  local ps_line
+  if [ "$OS" = "Darwin" ]; then
+    ps_line=$(ps -p "${pid}" -o etime=,%cpu=,%mem=,rss= 2>/dev/null || true)
+  else
+    ps_line=$(ps -p "${pid}" -o etime=,%cpu=,%mem=,rss= 2>/dev/null || true)
+  fi
+  if [ -n "${ps_line}" ]; then
+    local etime cpu mem rss
+    read -r etime cpu mem rss <<<"${ps_line}"
+    echo "  运行时长     : ${etime}"
+    echo "  CPU / MEM   : ${cpu}% / ${mem}% (RSS: $((rss / 1024)) MiB)"
+  fi
+}
+
+cmd_start() {
+  case "$OS" in
+    Darwin) _mac_start ;;
+    Linux) _linux_start ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+}
+
+cmd_stop() {
+  case "$OS" in
+    Darwin) _mac_stop ;;
+    Linux) _linux_stop ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+}
+
+cmd_restart() {
+  case "$OS" in
+    Darwin) _mac_restart ;;
+    Linux) _linux_restart ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+}
+
+cmd_install() {
+  case "$OS" in
+    Darwin) _mac_install ;;
+    Linux) _linux_install ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+}
+
+cmd_uninstall() {
+  case "$OS" in
+    Darwin) _mac_uninstall ;;
+    Linux) _linux_uninstall ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+}
+
+cmd_reload() {
+  case "$OS" in
+    Darwin) _mac_reload ;;
+    Linux) _linux_reload ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+}
+
+cmd_reload_config() {
+  local pid
+  if [ "$OS" = "Darwin" ]; then
+    pid=$(_launchd_pid)
+  else
+    pid=$(_read_pid_file)
+  fi
+  if ! _is_running_pid "${pid:-}"; then
+    log_err "服务未在运行，无法重载配置"
+    return 1
+  fi
+  kill -HUP "${pid}"
+  log_ok "已发送 SIGHUP（PID=${pid}），配置将立即重载"
+  log_info "查看日志确认: ding-bridge-manager logs 5"
+}
+
+cmd_status() {
+  echo
+  echo "${CLR_BOLD}════════════════════════════════════════${CLR_RESET}"
+  echo "${CLR_BOLD} ding-bridge 服务状态${CLR_RESET}"
+  echo "${CLR_BOLD}════════════════════════════════════════${CLR_RESET}"
+  echo "  平台         : ${OS}"
+  echo "  项目目录     : ${PROJECT_DIR}"
+  echo "  Python       : ${PYTHON}"
+  echo
+
+  case "$OS" in
+    Darwin) _mac_status ;;
+    Linux) _linux_status ;;
+    *) log_err "不支持的操作系统: $OS"; exit 1 ;;
+  esac
+
+  # 日志信息
+  echo
+  if [ -f "${STDERR_LOG}" ]; then
+    local err_size
+    err_size=$(du -h "${STDERR_LOG}" 2>/dev/null | awk '{print $1}')
+    echo "  stderr 日志  : ${STDERR_LOG} (${err_size})"
+  fi
+  if [ -f "${STDOUT_LOG}" ]; then
+    local out_size
+    out_size=$(du -h "${STDOUT_LOG}" 2>/dev/null | awk '{print $1}')
+    echo "  stdout 日志  : ${STDOUT_LOG} (${out_size})"
+  fi
+
+  echo
+  if [ -f "${STDERR_LOG}" ] && [ -s "${STDERR_LOG}" ]; then
+    echo "${CLR_DIM}最近 5 条业务日志：${CLR_RESET}"
+    tail -5 "${STDERR_LOG}" | sed "s/^/  /"
+  fi
+  echo
+}
+
+cmd_logs() {
+  local n="${1:-100}"
+  if [ ! -f "${STDERR_LOG}" ]; then
+    log_warn "日志文件还不存在：${STDERR_LOG}"
+    return 0
+  fi
+  echo "${CLR_DIM}==== stderr.log 最近 ${n} 行 ====${CLR_RESET}"
+  tail -n "${n}" "${STDERR_LOG}" | cat
+}
+
+cmd_follow() {
+  cmd_tail_err
+}
+
+cmd_tail_err() {
+  _ensure_log_dir
+  if [ ! -f "${STDERR_LOG}" ]; then
+    touch "${STDERR_LOG}"
+  fi
+  log_info "跟踪 stderr.log（Ctrl+C 退出）"
+  echo "${CLR_DIM}==================================${CLR_RESET}"
+  tail -f "${STDERR_LOG}"
+}
+
+cmd_tail_out() {
+  _ensure_log_dir
+  if [ ! -f "${STDOUT_LOG}" ]; then
+    touch "${STDOUT_LOG}"
+  fi
+  log_info "跟踪 stdout.log（Ctrl+C 退出）"
+  echo "${CLR_DIM}==================================${CLR_RESET}"
+  tail -f "${STDOUT_LOG}"
+}
+
+cmd_clear_logs() {
+  local had=0
+  if [ -f "${STDERR_LOG}" ]; then
+    : >"${STDERR_LOG}"
+    log_ok "已清空 ${STDERR_LOG}"
+    had=1
+  fi
+  if [ -f "${STDOUT_LOG}" ]; then
+    : >"${STDOUT_LOG}"
+    log_ok "已清空 ${STDOUT_LOG}"
+    had=1
+  fi
+  if [ "${had}" -eq 0 ]; then
+    log_warn "没有日志文件可清空"
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+${CLR_BOLD}ding-bridge-manager${CLR_RESET} — ding-bridge 服务管理脚本（${OS}）
+
+${CLR_BOLD}用法${CLR_RESET}:
+  ./scripts/ding-bridge-manager <命令>
+
+${CLR_BOLD}生命周期${CLR_RESET}:
+  ${CLR_GREEN}start${CLR_RESET}           启动服务（未安装则自动安装 [macOS]）
+  ${CLR_GREEN}stop${CLR_RESET}            停止服务（优雅退出，10 秒未退出会强杀）
+  ${CLR_GREEN}restart${CLR_RESET}         重启服务（改了代码后执行）
+  ${CLR_GREEN}reload-config${CLR_RESET}   热重载 config.ini（不重启进程，不断连接）
+  ${CLR_GREEN}reload${CLR_RESET}          重新加载服务配置（macOS: plist / Linux: 等同 restart）
+  ${CLR_GREEN}install${CLR_RESET}         安装为系统服务（macOS: launchd 开机自启）
+  ${CLR_GREEN}uninstall${CLR_RESET}       卸载系统服务
+
+${CLR_BOLD}状态与日志${CLR_RESET}:
+  ${CLR_GREEN}status${CLR_RESET}       查看状态（PID、CPU、运行时长、最近日志）
+  ${CLR_GREEN}logs [N]${CLR_RESET}     看最近 N 行业务日志（默认 100）
+  ${CLR_GREEN}follow${CLR_RESET}       实时跟踪业务日志（= tail-err）
+  ${CLR_GREEN}tail-err${CLR_RESET}     实时跟踪 stderr.log（业务主日志）
+  ${CLR_GREEN}tail-out${CLR_RESET}     实时跟踪 stdout.log
+  ${CLR_GREEN}clear-logs${CLR_RESET}   清空日志
+
+${CLR_BOLD}常用场景速查${CLR_RESET}:
+  改了代码            → ding-bridge-manager restart
+  改了 config.ini    → ding-bridge-manager reload-config
+  机器人没反应        → ding-bridge-manager status && ding-bridge-manager logs 50
+  实时调试           → ding-bridge-manager follow
+
+${CLR_BOLD}路径${CLR_RESET}:
+  项目根      ${PROJECT_DIR}
+  stderr 日志  ${STDERR_LOG}
+  stdout 日志  ${STDOUT_LOG}
+EOF
+}
+
+# ===== 入口 =====
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "${cmd}" in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    restart) cmd_restart "$@" ;;
+    reload) cmd_reload "$@" ;;
+    reload-config | rc) cmd_reload_config "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    status | st) cmd_status "$@" ;;
+    logs | log) cmd_logs "$@" ;;
+    follow | f) cmd_follow "$@" ;;
+    tail-err | err) cmd_tail_err "$@" ;;
+    tail-out | out) cmd_tail_out "$@" ;;
+    clear-logs | clear) cmd_clear_logs "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *)
+      log_err "未知命令: ${cmd}"
+      echo
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
